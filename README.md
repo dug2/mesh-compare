@@ -6,11 +6,13 @@ green in-tolerance band, hover-to-inspect, area-weighted statistics).
 
 Two run modes:
 
-1. **Single pair** — one subject vs. one reference, full-featured report
-   (full color map, out-of-tolerance toggle, optional ghosted reference
-   overlay).
+1. **Single pair** — one subject vs. one reference, one full-color HTML.
 2. **Batch from CSV** — many pairs in one run, optionally grouped by `case`
    into a multi-panel side-by-side HTML per case.
+
+Both modes render one full-color mesh per scene with a fixed ±1.0 mm color
+scale, so HTMLs stay light and panels are directly comparable across
+cases.
 
 ---
 
@@ -45,7 +47,6 @@ Common options:
 --display-faces 220000   Render face budget for the subject
 --ref-cloud 2000000      Sample density on reference for the distance KDTree
 --no-icp                 Skip alignment (trust input coordinates)
---no-ghost               Drop the ghosted reference overlay
 --out FILE.html          Custom output path
 --title "..."            Custom report title
 ```
@@ -97,6 +98,16 @@ toggle, no ghost overlay) so the combined HTML stays small enough to open in
 a browser. Each panel's mesh is capped at `--multi-display-faces` (default
 80,000) to keep file size manageable.
 
+Within each case, panels are placed in a fixed order regardless of CSV row
+order:
+
+1. left — `injected` vs `cad`
+2. center — `fit` vs `injected`
+3. right — `fit` vs `cad`
+
+Any rows whose `(subject_type, reference_type)` pair isn't in that list are
+appended after the three known panels in CSV order.
+
 #### Per-row mode
 
 If the CSV is missing the `case`/`subject_type`/`reference_type` columns, each
@@ -127,10 +138,12 @@ CSV) if it exists, otherwise the CSV's own directory. Override with
 
 ## Output
 
-- **`*.html`** — interactive Plotly report. Hover any vertex for signed
-  deviation in µm. Single-panel reports include a button bar to toggle
-  between the full color map, out-of-tolerance only, and a ghosted reference
-  overlay.
+- **`*.html`** — interactive Plotly report. One full-color mesh per scene;
+  rotate, pan, and zoom with the mouse. The color scale is fixed at
+  **±1.0 mm** for every panel and every report so colors are directly
+  comparable across cases and views (edit `FIXED_SCALE_MM` at the top of the
+  figure section in `stl_deviation_report.py` to change it; deviations
+  beyond the range get clamped to the endpoint color).
 - **`*.stats.json`** — area-weighted summary stats:
   - `pct_in_tol`, `pct_over_hi`, `pct_under_lo` (% of surface area)
   - `min_signed_mm`, `max_signed_mm`, `mean_abs_mm`, `rms_mm`
