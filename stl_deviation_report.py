@@ -274,11 +274,14 @@ def area_weighted_stats(vertices, faces, signed, tolerance):
     }
 
 
+FIXED_SCALE_MM = 1.0  # global cmin/cmax for every panel: ±1.0 mm
+
+
 def build_figure(vertices, faces, signed, tolerance, stats,
                  ref_vertices=None, ref_faces=None, title="Deviation report"):
     v, f = vertices, faces
 
-    cmax = max(3 * tolerance, float(np.percentile(np.abs(signed), 99)))
+    cmax = FIXED_SCALE_MM
     cmin = -cmax
     frac = tolerance / cmax
     c0 = 0.5 - frac / 2   # -tolerance boundary in the [0,1] colorscale
@@ -481,7 +484,9 @@ def compute_deviation(subject_path, reference_path, tolerance_um,
 def run(subject_path, reference_path, out_html, tolerance_um,
         display_faces, ref_cloud_samples, icp_samples, icp_max_iter,
         do_icp, include_reference_ghost, title=None, verbose=True):
-
+    # Single-pair reports use the same lightweight renderer as multi-panel
+    # mode: one full-color mesh, no OOT toggle, no ghost overlay. This keeps
+    # the HTML small enough to open in a browser without hanging.
     panel = compute_deviation(
         subject_path, reference_path,
         tolerance_um=tolerance_um,
@@ -490,15 +495,14 @@ def run(subject_path, reference_path, out_html, tolerance_um,
         icp_samples=icp_samples,
         icp_max_iter=icp_max_iter,
         do_icp=do_icp,
-        include_reference_ghost=include_reference_ghost,
+        include_reference_ghost=False,
         verbose=verbose,
     )
+    panel["label"] = f"{Path(subject_path).stem} vs {Path(reference_path).stem}"
 
     t = _tic("Writing HTML", verbose)
-    fig = build_figure(
-        panel["vertices"], panel["faces"], panel["signed"],
-        panel["tolerance_mm"], panel["stats"],
-        ref_vertices=panel["ref_vertices"], ref_faces=panel["ref_faces"],
+    fig = build_multi_figure(
+        [panel],
         title=title or f"Deviation: {Path(subject_path).stem} vs "
                        f"{Path(reference_path).stem}",
     )
@@ -517,7 +521,7 @@ def run(subject_path, reference_path, out_html, tolerance_um,
 # Multi-panel (per-case) figure
 # ----------------------------------------------------------------------------
 def _panel_colorscale(tolerance, signed):
-    cmax = max(3 * tolerance, float(np.percentile(np.abs(signed), 99)))
+    cmax = FIXED_SCALE_MM
     cmin = -cmax
     frac = tolerance / cmax
     c0 = 0.5 - frac / 2
@@ -583,6 +587,9 @@ def build_multi_figure(panels, title):
             len=0.75, thickness=10,
         )
 
+        hover_text = [
+            f"{s*1000:+.1f} µm" for s in signed
+        ]
         mesh_full = go.Mesh3d(
             x=v[:, 0], y=v[:, 1], z=v[:, 2],
             i=f[:, 0], j=f[:, 1], k=f[:, 2],
@@ -592,7 +599,8 @@ def build_multi_figure(panels, title):
             lighting=dict(ambient=0.55, diffuse=0.7, specular=0.15,
                           roughness=0.8, fresnel=0.05),
             lightposition=dict(x=100, y=200, z=150),
-            hoverinfo="skip",
+            text=hover_text,
+            hovertemplate="dev: %{text}<extra></extra>",
             name=p["label"],
         )
 
@@ -600,10 +608,14 @@ def build_multi_figure(panels, title):
 
     tol_um = int(round(panels[0]["tolerance_mm"] * 1000))
 
+    hidden_axis = dict(
+        visible=False, showgrid=False, zeroline=False, showline=False,
+        showticklabels=False, showbackground=False, title="",
+    )
     scene_kwargs = dict(
-        xaxis=dict(title="X (mm)"),
-        yaxis=dict(title="Y (mm)"),
-        zaxis=dict(title="Z (mm)"),
+        xaxis=hidden_axis,
+        yaxis=hidden_axis,
+        zaxis=hidden_axis,
         aspectmode="data",
         bgcolor="rgb(245,245,248)",
     )
@@ -666,7 +678,7 @@ def main(argv=None):
                    help="Skip ICP (and the PCA pre-alignment); trust input "
                         "coordinates as-is")
     p.add_argument("--no-ghost", action="store_true",
-                   help="Do not include the ghosted reference overlay")
+                   help=argparse.SUPPRESS)  # ghost overlay no longer rendered
     p.add_argument("--title", default=None, help="Report title")
     p.add_argument("--quiet", action="store_true",
                    help="Suppress progress output")
@@ -816,6 +828,23 @@ def _run_batch_per_row(rows, results_dir, default_out, default_title,
                   f"RMS={stats['rms_mm']*1000:.1f} um  -> {out_html}")
 
 
+PANEL_ORDER = [
+    ("injected", "cad"),
+    ("fit", "injected"),
+    ("fit", "cad"),
+]
+
+
+def _panel_sort_key(row):
+    stype = (row.get("subject_type") or "").strip().lower()
+    rtype = (row.get("reference_type") or "").strip().lower()
+    try:
+        return (PANEL_ORDER.index((stype, rtype)), 0)
+    except ValueError:
+        # Unknown combination -- keep it after the known ones, in CSV order.
+        return (len(PANEL_ORDER), 0)
+
+
 def _run_batch_per_case(rows, results_dir, default_out, default_title,
                         common_kwargs, _resolve):
     """Group rows by `case` and emit one multi-panel HTML per case."""
@@ -827,6 +856,9 @@ def _run_batch_per_case(rows, results_dir, default_out, default_title,
             cases[case] = []
             case_order.append(case)
         cases[case].append(row)
+
+    for case in cases:
+        cases[case].sort(key=_panel_sort_key)
 
     summary = []
     for case in case_order:
