@@ -1,0 +1,16 @@
+# Dependencies for stl_deviation_report.py
+#
+# Install (Windows):       py -m pip install -r requirements.txt
+# Install (macOS / Linux): python3 -m pip install -r requirements.txt
+#
+# All packages below ship prebuilt wheels for 64-bit Python on Windows,
+# macOS, and Linux, so no compiler is needed.
+
+numpy
+scipy
+trimesh
+plotly
+rtree                 # trimesh's spatial index (used during loading/sampling)
+fast-simplification   # optional but recommended: decimates the mesh so the
+                      # output HTML stays small. If its install ever fails,
+                      # delete this line — the script still runs, just heavier.

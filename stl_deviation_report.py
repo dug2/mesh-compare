@@ -19,10 +19,11 @@ What it does
    sign((P - nearest) . n_ref), i.e. + for "material extra / outside" and
    - for "material missing / inside".
 6. Builds an interactive Plotly 3D HTML report with:
-      * Signed colour map (diverging red/blue with a neutral in-tolerance band)
-      * Toggle to show only out-of-tolerance regions (|d| > tolerance)
-      * Optional ghosted reference overlay
+      * Signed Geomagic-style colour map: blue = inside / under-build,
+        a green in-tolerance band, red = outside / over-build
       * Area-weighted summary stats (mean, RMS, min, max, % in/out of tol)
+      * One full-colour mesh per scene so the HTML stays light enough to open
+        in a browser; batch mode can place several panels side by side.
 
 Requirements
 ------------
@@ -62,6 +63,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import sys
 import time
@@ -86,8 +88,8 @@ def _require(name, pip_name=None):
 
 
 trimesh = _require("trimesh")
-plotly  = _require("plotly")
-scipy   = _require("scipy", "scipy")
+_require("plotly")
+_require("scipy")
 _require("rtree")  # used by trimesh for spatial indices; not imported directly
 import plotly.graph_objects as go           # noqa: E402
 from plotly.subplots import make_subplots    # noqa: E402
@@ -103,6 +105,49 @@ except ImportError:
 # ----------------------------------------------------------------------------
 # Small helpers
 # ----------------------------------------------------------------------------
+def _force_utf8_stdio():
+    """Make stdout/stderr tolerate non-ASCII (the ✓, µ, ± we print) everywhere.
+
+    On Windows the console -- and any redirected pipe/file -- defaults to a
+    legacy code page (cp1252/cp437) that cannot encode these characters, so an
+    otherwise successful run would die mid-way with UnicodeEncodeError.
+    Reconfiguring to UTF-8 with errors="replace" keeps the progress output safe
+    on every platform and degrades gracefully if a glyph still can't be shown.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass  # very old Python, or an already-wrapped stream; ignore
+
+
+def _json_safe(obj):
+    """Recursively replace non-finite floats (NaN/Inf) with None.
+
+    Python's json writes bare ``NaN``/``Infinity`` tokens by default, which are
+    invalid JSON and rejected by browsers (``JSON.parse``) and most parsers.
+    ``icp_rms_mm`` is NaN whenever ``--no-icp`` is used, so sanitise before
+    writing the .stats.json sidecar.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+def _plotlyjs_mode(embed):
+    """Choose how write_html bundles plotly.js.
+
+    ``True`` inlines the whole library (~3 MB) so the report opens offline;
+    ``"cdn"`` (default) keeps the HTML small but needs internet the first time
+    it is opened.
+    """
+    return True if embed else "cdn"
+
+
 def _tic(msg, verbose=True):
     if verbose:
         print(f"[.] {msg} ...", flush=True)
@@ -137,7 +182,7 @@ def _kabsch(A, B):
 
 def _simplify(vertices, faces, target_faces):
     """Return a decimated (vertices, faces) pair, or the originals if unneeded."""
-    if len(faces) <= target_faces:
+    if target_faces <= 0 or len(faces) <= target_faces:
         return vertices, faces
     if not HAVE_FAST_SIMPLIFY:
         print("  (warning) fast_simplification not installed; rendering full mesh")
@@ -217,30 +262,32 @@ def icp(subj_pts, ref_pts, ref_tree, T0, max_iter=60, tol=1e-5,
 # ----------------------------------------------------------------------------
 def build_ref_cloud(ref, n_samples, verbose=True):
     t = _tic("Building reference surface cloud + KDTree", verbose)
-    pts, face = trimesh.sample.sample_surface(ref, n_samples)
+    pts, sample_face = trimesh.sample.sample_surface(ref, n_samples)
+    # Carry the true outward normal for every cloud point so the deviation can
+    # be signed correctly. Surface samples use their containing face's normal;
+    # the appended reference vertices use the (area-weighted) vertex normal,
+    # which is consistent across all faces meeting at that vertex. The previous
+    # approach tagged each vertex with an *arbitrary* incident face (last-write
+    # wins on a fancy-index assignment), which flipped the sign of points that
+    # snapped to a vertex at a sharp edge/corner.
+    normals = np.vstack([ref.face_normals[sample_face], ref.vertex_normals])
     pts = np.vstack([pts, ref.vertices])
-    vert_face = np.zeros(len(ref.vertices), dtype=np.int64)
-    fi = np.arange(len(ref.faces), dtype=np.int64)
-    vert_face[ref.faces[:, 0]] = fi
-    vert_face[ref.faces[:, 1]] = fi
-    vert_face[ref.faces[:, 2]] = fi
-    face = np.concatenate([face, vert_face])
     tree = cKDTree(pts)
     _toc(t, f"cloud size = {len(pts):,}", verbose)
-    return pts, face, tree
+    return pts, normals, tree
 
 
-def signed_deviation(points, ref, ref_cloud, ref_cloud_face, ref_tree,
+def signed_deviation(points, ref_cloud, ref_cloud_normals, ref_tree,
                      verbose=True):
     t = _tic("Nearest-point query for each display vertex", verbose)
     dist, nn = ref_tree.query(points, k=1, workers=-1)
     _toc(t, f"mean|d|={dist.mean():.4f} mm, max|d|={dist.max():.4f} mm",
          verbose)
 
-    t = _tic("Signing the distances with reference face normals", verbose)
-    face_normals = ref.face_normals[ref_cloud_face[nn]]
+    t = _tic("Signing the distances with reference surface normals", verbose)
+    normals = ref_cloud_normals[nn]
     delta = points - ref_cloud[nn]
-    sgn = np.sign(np.einsum("ij,ij->i", delta, face_normals))
+    sgn = np.sign(np.einsum("ij,ij->i", delta, normals))
     sgn[sgn == 0] = 1.0
     _toc(t, verbose=verbose)
     return sgn * dist
@@ -257,6 +304,11 @@ def area_weighted_stats(vertices, faces, signed, tolerance):
     for k in range(3):
         np.add.at(w, faces[:, k], face_areas / 3.0)
     abs_d = np.abs(signed)
+
+    if w.sum() <= 0:
+        # Degenerate display mesh (zero total area): fall back to unweighted
+        # per-vertex stats so we still emit numbers instead of dividing by zero.
+        w = np.ones(len(vertices))
 
     def wpct(mask):
         return 100.0 * w[mask].sum() / w.sum()
@@ -277,143 +329,15 @@ def area_weighted_stats(vertices, faces, signed, tolerance):
 FIXED_SCALE_MM = 1.0  # global cmin/cmax for every panel: ±1.0 mm
 
 
-def build_figure(vertices, faces, signed, tolerance, stats,
-                 ref_vertices=None, ref_faces=None, title="Deviation report"):
-    v, f = vertices, faces
-
-    cmax = FIXED_SCALE_MM
-    cmin = -cmax
-    frac = tolerance / cmax
-    c0 = 0.5 - frac / 2   # -tolerance boundary in the [0,1] colorscale
-    c1 = 0.5 + frac / 2   # +tolerance boundary in the [0,1] colorscale
-    eps = 1e-4
-
-    def _lin(a, b, t):
-        return a + (b - a) * t
-
-    # Geomagic-style palette:
-    #   deep blue -> blue -> cyan -> (hard step) -> solid GREEN in-tolerance
-    #   (hard step) -> yellow -> orange -> deep red
-    colorscale = [
-        [0.00,                       "rgb(0,0,170)"],      # deep blue
-        [_lin(0.0, c0, 0.33),        "rgb(0,90,230)"],     # blue
-        [_lin(0.0, c0, 0.66),        "rgb(0,180,240)"],    # cyan
-        [max(0.0, c0 - eps),         "rgb(100,220,230)"],  # light cyan, just below -tol
-        [c0,                         "rgb(40,180,60)"],    # GREEN band starts (step)
-        [c1,                         "rgb(40,180,60)"],    # GREEN band ends   (step)
-        [min(1.0, c1 + eps),         "rgb(230,230,80)"],   # yellow-green, just above +tol
-        [_lin(c1, 1.0, 0.33),        "rgb(255,200,0)"],    # yellow
-        [_lin(c1, 1.0, 0.66),        "rgb(255,110,0)"],    # orange
-        [1.00,                       "rgb(180,0,0)"],      # deep red
-    ]
-
-    hover_text = [
-        f"signed dev: {s*1000:+.1f} \u00b5m<br>|dev|: {abs(s)*1000:.1f} \u00b5m"
-        for s in signed
-    ]
-
-    mesh_full = go.Mesh3d(
-        x=v[:, 0], y=v[:, 1], z=v[:, 2],
-        i=f[:, 0], j=f[:, 1], k=f[:, 2],
-        intensity=signed, intensitymode="vertex",
-        colorscale=colorscale, cmin=cmin, cmax=cmax, showscale=True,
-        colorbar=dict(title=dict(text="Signed deviation (mm)", side="right"),
-                      tickformat=".3f"),
-        lighting=dict(ambient=0.55, diffuse=0.7, specular=0.15,
-                      roughness=0.8, fresnel=0.05),
-        lightposition=dict(x=100, y=200, z=150),
-        hoverinfo="text", text=hover_text, visible=True,
-        name="Subject (colored)",
-    )
-
-    oot_mask = np.abs(signed) > tolerance
-    signed_oot = np.where(oot_mask, signed, np.nan)
-    mesh_oot = go.Mesh3d(
-        x=v[:, 0], y=v[:, 1], z=v[:, 2],
-        i=f[:, 0], j=f[:, 1], k=f[:, 2],
-        intensity=signed_oot, intensitymode="vertex",
-        colorscale=colorscale, cmin=cmin, cmax=cmax, showscale=True,
-        colorbar=dict(title=dict(text="Signed deviation (mm)", side="right"),
-                      tickformat=".3f"),
-        lighting=dict(ambient=0.55, diffuse=0.7, specular=0.15),
-        lightposition=dict(x=100, y=200, z=150),
-        hoverinfo="text", text=hover_text, visible=False,
-        name=f"Out of tolerance (|d|>{tolerance*1000:.0f} \u00b5m)",
-    )
-
-    traces = [mesh_full, mesh_oot]
-    if ref_vertices is not None and ref_faces is not None:
-        traces.append(go.Mesh3d(
-            x=ref_vertices[:, 0], y=ref_vertices[:, 1], z=ref_vertices[:, 2],
-            i=ref_faces[:, 0], j=ref_faces[:, 1], k=ref_faces[:, 2],
-            color="rgb(200,200,200)", opacity=0.35,
-            name="Reference (ghost)", hoverinfo="skip",
-            showscale=False,
-            lighting=dict(ambient=0.7, diffuse=0.4),
-            visible=False,
-        ))
-        buttons = [
-            dict(label="Full color map",
-                 method="update", args=[{"visible": [True, False, False]}]),
-            dict(label=f"Only |d|>{int(tolerance*1000)} \u00b5m",
-                 method="update", args=[{"visible": [False, True, False]}]),
-            dict(label="Full + reference ghost",
-                 method="update", args=[{"visible": [True, False, True]}]),
-            dict(label="OOT + reference ghost",
-                 method="update", args=[{"visible": [False, True, True]}]),
-        ]
-    else:
-        buttons = [
-            dict(label="Full color map",
-                 method="update", args=[{"visible": [True, False]}]),
-            dict(label=f"Only |d|>{int(tolerance*1000)} \u00b5m",
-                 method="update", args=[{"visible": [False, True]}]),
-        ]
-
-    fig = go.Figure(data=traces)
-    subtitle = (
-        f"Tolerance \u00b1{tolerance*1000:.0f} \u00b5m \u2014 "
-        f"in-tol: <b>{stats['pct_in_tol']:.2f}%</b> \u00b7 "
-        f"over-build (>+tol): <b>{stats['pct_over_hi']:.2f}%</b> \u00b7 "
-        f"under-build (<\u2212tol): <b>{stats['pct_under_lo']:.2f}%</b><br>"
-        f"min = {stats['min_signed_mm']*1000:+.1f} \u00b5m \u00b7 "
-        f"max = {stats['max_signed_mm']*1000:+.1f} \u00b5m \u00b7 "
-        f"mean |d| = {stats['mean_abs_mm']*1000:.1f} \u00b5m \u00b7 "
-        f"RMS = {stats['rms_mm']*1000:.1f} \u00b5m"
-    )
-    fig.update_layout(
-        title=dict(
-            text=f"<b>{title}</b><br>"
-                 f"<span style='font-size:12px;color:#555'>{subtitle}</span>",
-            x=0.02, xanchor="left",
-        ),
-        scene=dict(
-            xaxis=dict(title="X (mm)"),
-            yaxis=dict(title="Y (mm)"),
-            zaxis=dict(title="Z (mm)"),
-            aspectmode="data",
-            bgcolor="rgb(245,245,248)",
-        ),
-        margin=dict(l=0, r=0, t=70, b=0),
-        updatemenus=[dict(
-            type="buttons", direction="right",
-            x=0.02, y=0.98, xanchor="left", yanchor="top",
-            buttons=buttons,
-        )],
-    )
-    return fig
-
-
 # ----------------------------------------------------------------------------
 # Main CLI
 # ----------------------------------------------------------------------------
 def compute_deviation(subject_path, reference_path, tolerance_um,
                       display_faces, ref_cloud_samples, icp_samples,
-                      icp_max_iter, do_icp, include_reference_ghost,
-                      verbose=True):
+                      icp_max_iter, do_icp, verbose=True):
     """Run alignment + deviation for one (subject, reference) pair.
 
-    Returns a dict suitable for build_figure / build_multi_figure.
+    Returns a dict suitable for build_multi_figure.
     """
     tolerance_mm = tolerance_um / 1000.0
 
@@ -446,11 +370,11 @@ def compute_deviation(subject_path, reference_path, tolerance_um,
     _toc(t, f"display mesh: {len(subj_disp.faces):,} faces, "
             f"{len(subj_disp.vertices):,} verts", verbose)
 
-    ref_cloud, ref_cloud_face, ref_tree = build_ref_cloud(
+    ref_cloud, ref_cloud_normals, ref_tree = build_ref_cloud(
         ref, ref_cloud_samples, verbose=verbose
     )
     signed = signed_deviation(
-        subj_disp.vertices, ref, ref_cloud, ref_cloud_face, ref_tree,
+        subj_disp.vertices, ref_cloud, ref_cloud_normals, ref_tree,
         verbose=verbose,
     )
 
@@ -466,27 +390,19 @@ def compute_deviation(subject_path, reference_path, tolerance_um,
         print(json.dumps(stats, indent=2))
     _toc(t, verbose=verbose)
 
-    ref_v, ref_f = (None, None)
-    if include_reference_ghost:
-        t = _tic("Decimating reference for ghost overlay", verbose)
-        ref_v, ref_f = _simplify(ref.vertices, ref.faces,
-                                 min(80000, display_faces))
-        _toc(t, f"ghost: {len(ref_f):,} faces", verbose)
-
     return dict(
         vertices=subj_disp.vertices, faces=subj_disp.faces,
         signed=signed, tolerance_mm=tolerance_mm, stats=stats,
-        ref_vertices=ref_v, ref_faces=ref_f,
         subject_path=subject_path, reference_path=reference_path,
     )
 
 
 def run(subject_path, reference_path, out_html, tolerance_um,
         display_faces, ref_cloud_samples, icp_samples, icp_max_iter,
-        do_icp, include_reference_ghost, title=None, verbose=True):
+        do_icp, title=None, verbose=True, embed_plotlyjs=False):
     # Single-pair reports use the same lightweight renderer as multi-panel
-    # mode: one full-color mesh, no OOT toggle, no ghost overlay. This keeps
-    # the HTML small enough to open in a browser without hanging.
+    # mode: one full-color mesh. This keeps the HTML small enough to open in a
+    # browser without hanging.
     panel = compute_deviation(
         subject_path, reference_path,
         tolerance_um=tolerance_um,
@@ -495,7 +411,6 @@ def run(subject_path, reference_path, out_html, tolerance_um,
         icp_samples=icp_samples,
         icp_max_iter=icp_max_iter,
         do_icp=do_icp,
-        include_reference_ghost=False,
         verbose=verbose,
     )
     panel["label"] = f"{Path(subject_path).stem} vs {Path(reference_path).stem}"
@@ -508,11 +423,13 @@ def run(subject_path, reference_path, out_html, tolerance_um,
     )
     os.makedirs(os.path.dirname(os.path.abspath(out_html)) or ".",
                 exist_ok=True)
-    fig.write_html(out_html, include_plotlyjs="cdn", full_html=True)
+    fig.write_html(out_html, include_plotlyjs=_plotlyjs_mode(embed_plotlyjs),
+                   full_html=True)
     _toc(t, f"wrote {out_html}", verbose)
 
-    with open(Path(out_html).with_suffix(".stats.json"), "w") as fh:
-        json.dump(panel["stats"], fh, indent=2)
+    with open(Path(out_html).with_suffix(".stats.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump(_json_safe(panel["stats"]), fh, indent=2)
 
     return panel["stats"]
 
@@ -523,7 +440,11 @@ def run(subject_path, reference_path, out_html, tolerance_um,
 def _panel_colorscale(tolerance, signed):
     cmax = FIXED_SCALE_MM
     cmin = -cmax
-    frac = tolerance / cmax
+    # Clamp the band so its stops can't reach/cross the [0,1] ends or each
+    # other. A tolerance >= the fixed colour scale would otherwise push c0<=0
+    # and c1>=1, producing a non-monotonic / out-of-range colorscale that
+    # Plotly rejects with a ValueError (crashing report generation).
+    frac = min(max(tolerance / cmax, 0.0), 0.98)
     c0 = 0.5 - frac / 2
     c1 = 0.5 + frac / 2
     eps = 1e-4
@@ -639,6 +560,7 @@ def build_multi_figure(panels, title):
 
 
 def main(argv=None):
+    _force_utf8_stdio()
     p = argparse.ArgumentParser(
         description="Build a Geomagic-style deviation report for two STL files.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -677,8 +599,13 @@ def main(argv=None):
     p.add_argument("--no-icp", action="store_true",
                    help="Skip ICP (and the PCA pre-alignment); trust input "
                         "coordinates as-is")
+    p.add_argument("--embed-plotlyjs", action="store_true",
+                   help="Inline plotly.js in the HTML (~3 MB larger per file) "
+                        "so the report opens offline. Default loads it from a "
+                        "CDN, which needs internet the first time the HTML is "
+                        "opened.")
     p.add_argument("--no-ghost", action="store_true",
-                   help=argparse.SUPPRESS)  # ghost overlay no longer rendered
+                   help=argparse.SUPPRESS)  # accepted for back-compat; no effect
     p.add_argument("--title", default=None, help="Report title")
     p.add_argument("--quiet", action="store_true",
                    help="Suppress progress output")
@@ -691,7 +618,6 @@ def main(argv=None):
         icp_samples=args.icp_samples,
         icp_max_iter=args.icp_iter,
         do_icp=not args.no_icp,
-        include_reference_ghost=not args.no_ghost,
         verbose=not args.quiet,
     )
     multi_display_faces = args.multi_display_faces
@@ -706,6 +632,7 @@ def main(argv=None):
             default_title=args.title,
             common_kwargs=common_kwargs,
             multi_display_faces=multi_display_faces,
+            embed_plotlyjs=args.embed_plotlyjs,
         )
         return
 
@@ -722,12 +649,13 @@ def main(argv=None):
         reference_path=args.reference,
         out_html=out_html,
         title=args.title,
+        embed_plotlyjs=args.embed_plotlyjs,
         **common_kwargs,
     )
 
 
 def run_batch(batch_csv, batch_dir, default_out, default_title, common_kwargs,
-              multi_display_faces=80_000):
+              multi_display_faces=80_000, embed_plotlyjs=False):
     csv_path = Path(batch_csv).resolve()
     if batch_dir:
         base_dir = Path(batch_dir).resolve()
@@ -737,7 +665,10 @@ def run_batch(batch_csv, batch_dir, default_out, default_title, common_kwargs,
     results_dir = csv_path.parent / "results"
     results_dir.mkdir(exist_ok=True)
 
-    with open(csv_path, newline="") as fh:
+    # utf-8-sig tolerates the BOM that Excel/Windows tools prepend to CSVs and
+    # decodes non-ASCII paths/case names correctly regardless of the OS code
+    # page (a bare open() would use cp1252 on Windows and mangle them).
+    with open(csv_path, newline="", encoding="utf-8-sig") as fh:
         rows = list(csv.DictReader(fh))
 
     if not rows:
@@ -760,21 +691,19 @@ def run_batch(batch_csv, batch_dir, default_out, default_title, common_kwargs,
 
     if multi_panel:
         multi_kwargs = dict(common_kwargs)
-        # Multi-panel HTMLs must stay openable -- cap per-panel mesh size and
-        # skip the reference ghost (would triple the trace count).
+        # Multi-panel HTMLs must stay openable -- cap per-panel mesh size.
         multi_kwargs["display_faces"] = min(
             common_kwargs["display_faces"], multi_display_faces
         )
-        multi_kwargs["include_reference_ghost"] = False
         _run_batch_per_case(rows, results_dir, default_out, default_title,
-                            multi_kwargs, _resolve)
+                            multi_kwargs, _resolve, embed_plotlyjs)
     else:
         _run_batch_per_row(rows, results_dir, default_out, default_title,
-                           common_kwargs, _resolve)
+                           common_kwargs, _resolve, embed_plotlyjs)
 
 
 def _run_batch_per_row(rows, results_dir, default_out, default_title,
-                       common_kwargs, _resolve):
+                       common_kwargs, _resolve, embed_plotlyjs=False):
     n = len(rows)
     results = []
     for i, row in enumerate(rows, 1):
@@ -811,6 +740,7 @@ def _run_batch_per_row(rows, results_dir, default_out, default_title,
                 reference_path=reference,
                 out_html=out_html,
                 title=title,
+                embed_plotlyjs=embed_plotlyjs,
                 **common_kwargs,
             )
             results.append((run_number, case, out_html, stats, None))
@@ -846,7 +776,7 @@ def _panel_sort_key(row):
 
 
 def _run_batch_per_case(rows, results_dir, default_out, default_title,
-                        common_kwargs, _resolve):
+                        common_kwargs, _resolve, embed_plotlyjs=False):
     """Group rows by `case` and emit one multi-panel HTML per case."""
     cases = {}            # case -> list of rows in CSV order
     case_order = []
@@ -903,7 +833,8 @@ def _run_batch_per_case(rows, results_dir, default_out, default_title,
         fig = build_multi_figure(panels, title=title)
         os.makedirs(os.path.dirname(os.path.abspath(out_html)) or ".",
                     exist_ok=True)
-        fig.write_html(out_html, include_plotlyjs="cdn", full_html=True)
+        fig.write_html(out_html, include_plotlyjs=_plotlyjs_mode(embed_plotlyjs),
+                       full_html=True)
         _toc(t, f"wrote {out_html}",
              common_kwargs.get("verbose", True))
 
@@ -920,8 +851,9 @@ def _run_batch_per_case(rows, results_dir, default_out, default_title,
             ],
             "failures": [{"label": l, "error": e} for l, e in failures],
         }
-        with open(Path(out_html).with_suffix(".stats.json"), "w") as fh:
-            json.dump(case_stats, fh, indent=2)
+        with open(Path(out_html).with_suffix(".stats.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(_json_safe(case_stats), fh, indent=2)
 
         summary.append((case, out_html, [(l, e) for l, e in failures]))
 

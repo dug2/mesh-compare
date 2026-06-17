@@ -18,7 +18,20 @@ cases.
 
 ## Install
 
-Requires Python ≥ 3.9.
+Requires Python ≥ 3.9 (64-bit). All dependencies ship prebuilt wheels for
+Windows, macOS, and Linux, so no compiler is needed.
+
+Recommended — install everything from the pinned list:
+
+```
+# Windows (PowerShell or Command Prompt)
+py -m pip install -r requirements.txt
+
+# macOS / Linux
+python3 -m pip install -r requirements.txt
+```
+
+Or install the packages directly:
 
 ```
 pip install numpy scipy trimesh plotly fast-simplification rtree
@@ -26,6 +39,47 @@ pip install numpy scipy trimesh plotly fast-simplification rtree
 
 `fast-simplification` is optional but recommended; without it the renderer
 ships the un-decimated mesh, which makes the HTML huge.
+
+> **Windows users:** see the [Windows / PC quick start](#windows--pc-quick-start)
+> below for step-by-step setup (virtual environment, running the script, and
+> opening the report).
+
+---
+
+## Windows / PC quick start
+
+1. **Install Python.** Get it from [python.org/downloads](https://www.python.org/downloads/)
+   and tick **“Add python.exe to PATH”** in the installer. This gives you the
+   `py` launcher.
+2. **Open a terminal** in this folder: in File Explorer, Shift-right-click the
+   `mesh-compare` folder → **Open in Terminal** (or **Open PowerShell window
+   here**).
+3. **(Optional but tidy) create a virtual environment:**
+   ```
+   py -m venv .venv
+   .venv\Scripts\activate
+   ```
+4. **Install dependencies:**
+   ```
+   py -m pip install -r requirements.txt
+   ```
+5. **Run a comparison** (use `py` instead of `python` if `python` isn’t found):
+   ```
+   py stl_deviation_report.py scans\SUBJECT.stl scans\REFERENCE.stl
+   ```
+6. **Open the report.** Double-click the generated `*_deviation.html`, or run
+   `start SUBJECT_deviation.html`. By default the report pulls the Plotly
+   library from the internet the first time you open it — if the machine is
+   **offline**, add `--embed-plotlyjs` (see below) so the library is baked into
+   the file.
+
+Notes for Windows:
+
+- Use backslashes (`scans\part.stl`) or forward slashes — both work.
+- Non-ASCII paths, accented case names, and CSVs saved from Excel (which add a
+  byte-order mark) are handled correctly.
+- Progress output (`✓`, `µm`) prints fine in the console **and** when you redirect
+  it to a log file, e.g. `py stl_deviation_report.py ... > run.log 2>&1`.
 
 ---
 
@@ -47,6 +101,8 @@ Common options:
 --display-faces 220000   Render face budget for the subject
 --ref-cloud 2000000      Sample density on reference for the distance KDTree
 --no-icp                 Skip alignment (trust input coordinates)
+--embed-plotlyjs         Bake plotly.js into the HTML so it opens offline
+                         (~3 MB larger; default loads it from a CDN)
 --out FILE.html          Custom output path
 --title "..."            Custom report title
 ```
@@ -189,6 +245,9 @@ per panel.
 - **Blank HTML / browser hangs.** File too big — bring `--display-faces` (or
   `--multi-display-faces`) down. Anything past a few hundred MB will struggle
   to render.
+- **Blank / unstyled report on a machine with no internet.** The HTML loads the
+  Plotly library from a CDN by default. Re-run with `--embed-plotlyjs` to bake
+  the library into the file so it works fully offline.
 - **Alignment looks wrong.** Increase `--icp-samples`, `--icp-iter`, or both.
   If the meshes share a coordinate system already, try `--no-icp`.
 - **`fast_simplification not installed` warning.** Install it
