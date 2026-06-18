@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Generated reports and inputs
+results/
+*_deviation.html
+*.stats.json
+
+# OS cruft
+.DS_Store
+Thumbs.db
